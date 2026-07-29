@@ -1,0 +1,545 @@
+#!/usr/bin/env python3
+"""Fetch Grok Build credit balance and optionally set the terminal window title.
+
+Reads the OIDC/session token from ~/.grok/auth.json and queries:
+  https://grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig
+
+Usage:
+  grok-credits              Human-readable summary
+  grok-credits --json       Machine-readable JSON
+  grok-credits --short      One-line status (for title bars)
+  grok-credits --title      Update terminal window title (and print short line)
+  grok-credits --title-only Update title only (quiet; for hooks)
+  grok-credits --no-cache   Bypass the local cache
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import math
+import os
+import struct
+import sys
+import tempfile
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+ENDPOINT = "https://grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig"
+SUBSCRIPTIONS_URL = "https://grok.com/rest/subscriptions"
+OIDC_SCOPE_PREFIX = "https://auth.x.ai::"
+LEGACY_SCOPE = "https://accounts.x.ai/sign-in"
+CACHE_TTL_SECS = 100
+
+
+class CreditsError(Exception):
+    pass
+
+
+def grok_home() -> Path:
+    return Path(os.environ.get("GROK_HOME", "~/.grok")).expanduser()
+
+
+def auth_file() -> Path:
+    override = os.environ.get("GROK_AUTH_FILE")
+    if override:
+        return Path(override).expanduser()
+    return grok_home() / "auth.json"
+
+
+def cache_file() -> Path:
+    return grok_home() / "cache" / "credits.json"
+
+
+def utc_now() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def isoformat(value: dt.datetime | None) -> str | None:
+    if value is None:
+        return None
+    return value.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def select_auth_entry(root: dict) -> tuple[str, dict]:
+    if isinstance(root.get("key"), str) and root["key"]:
+        return "direct", root
+
+    oidc = legacy = fallback = None
+    for scope, entry in root.items():
+        if not isinstance(entry, dict):
+            continue
+        token = entry.get("key")
+        if not isinstance(token, str) or not token:
+            continue
+        current = (scope, entry)
+        if isinstance(scope, str) and scope.startswith(OIDC_SCOPE_PREFIX):
+            oidc = current
+        elif scope == LEGACY_SCOPE or (isinstance(scope, str) and "/sign-in" in scope):
+            legacy = current
+        elif fallback is None:
+            fallback = current
+
+    selected = oidc or legacy or fallback
+    if selected is None:
+        raise CreditsError("No access token in auth.json — run `grok login`")
+    return selected
+
+
+def load_token() -> tuple[str, dict]:
+    path = auth_file()
+    if not path.exists():
+        raise CreditsError(f"Auth file not found: {path} — run `grok login`")
+    try:
+        root = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise CreditsError(f"Failed to read auth file: {exc}") from exc
+    if not isinstance(root, dict):
+        raise CreditsError("auth.json root is not an object")
+
+    scope, entry = select_auth_entry(root)
+    meta = {
+        "scope": scope,
+        "email": entry.get("email"),
+        "team_id": entry.get("team_id"),
+        "auth_mode": entry.get("auth_mode"),
+        "expires_at": entry.get("expires_at"),
+    }
+    return entry["key"], meta
+
+
+def read_varint(data: bytes, index: int) -> tuple[int | None, int]:
+    value = 0
+    shift = 0
+    while index < len(data) and shift < 64:
+        byte = data[index]
+        index += 1
+        value |= (byte & 0x7F) << shift
+        if byte & 0x80 == 0:
+            return value, index
+        shift += 7
+    return None, index
+
+
+def grpc_web_data_frames(data: bytes) -> list[bytes]:
+    frames: list[bytes] = []
+    index = 0
+    while index + 5 <= len(data):
+        flags = data[index]
+        length = int.from_bytes(data[index + 1 : index + 5], "big")
+        start = index + 5
+        end = start + length
+        if end > len(data):
+            break
+        if flags & 0x80 == 0:
+            frames.append(data[start:end])
+        index = end
+    return frames
+
+
+def scan_protobuf(
+    data: bytes, depth: int = 0, path: list[int] | None = None, order: int = 0
+) -> tuple[list[dict], list[dict], int]:
+    if path is None:
+        path = []
+    varints: list[dict] = []
+    fixed32: list[dict] = []
+    index = 0
+    next_order = order
+    while index < len(data):
+        field_start = index
+        key, index = read_varint(data, index)
+        if not key:
+            index = field_start + 1
+            continue
+        field_number = key >> 3
+        wire_type = key & 0x07
+        field_path = path + [field_number]
+
+        if wire_type == 0:
+            value, index = read_varint(data, index)
+            if value is None:
+                index = field_start + 1
+                continue
+            varints.append({"path": field_path, "value": value})
+        elif wire_type == 1:
+            if index + 8 > len(data):
+                break
+            index += 8
+        elif wire_type == 2:
+            length, index = read_varint(data, index)
+            if length is None or length > len(data) - index:
+                index = field_start + 1
+                continue
+            start = index
+            end = index + int(length)
+            if depth < 4:
+                nested_v, nested_f, next_order = scan_protobuf(
+                    data[start:end], depth + 1, field_path, next_order
+                )
+                varints.extend(nested_v)
+                fixed32.extend(nested_f)
+            index = end
+        elif wire_type == 5:
+            if index + 4 > len(data):
+                break
+            try:
+                value = struct.unpack("<f", data[index : index + 4])[0]
+            except struct.error:
+                index += 4
+                continue
+            index += 4
+            if math.isfinite(value):
+                fixed32.append({"path": field_path, "value": value, "order": next_order})
+                next_order += 1
+        else:
+            index = field_start + 1
+    return varints, fixed32, next_order
+
+
+def parse_billing(data: bytes) -> dict:
+    frames = grpc_web_data_frames(data)
+    if not frames:
+        raise CreditsError("Billing response contained no data frames")
+
+    varints: list[dict] = []
+    fixed32: list[dict] = []
+    order = 0
+    for frame in frames:
+        v, f, order = scan_protobuf(frame, order=order)
+        varints.extend(v)
+        fixed32.extend(f)
+
+    candidates = [
+        field
+        for field in fixed32
+        if field["path"] and field["path"][-1] == 1 and 0 <= field["value"] <= 100
+    ]
+    candidates.sort(key=lambda field: (len(field["path"]), field["order"]))
+    preferred = [c for c in candidates if c["path"] == [1, 1]]
+    ordered = preferred or candidates
+
+    now = utc_now()
+    reset_candidates: list[tuple[list[int], dt.datetime]] = []
+    for field in varints:
+        raw = field["value"]
+        if 1_700_000_000 <= raw <= 2_100_000_000:
+            date = dt.datetime.fromtimestamp(raw, dt.timezone.utc)
+            if date > now:
+                reset_candidates.append((field["path"], date))
+
+    preferred_resets = [d for p, d in reset_candidates if p == [1, 5, 1]]
+    all_resets = [d for _, d in reset_candidates]
+    reset_at = min(preferred_resets or all_resets) if (preferred_resets or all_resets) else None
+
+    has_local_reset = any(field["path"][:2] == [1, 6] for field in varints)
+    if ordered:
+        used_percent = float(ordered[0]["value"])
+    elif not fixed32 and reset_at and has_local_reset:
+        used_percent = 0.0
+    else:
+        raise CreditsError("Could not parse credit usage from billing response")
+
+    used_percent = max(0.0, min(100.0, used_percent))
+    remaining_percent = max(0.0, 100.0 - used_percent)
+    return {
+        "monthly_used_percent": used_percent,
+        "monthly_remaining_percent": remaining_percent,
+        "resets_at": isoformat(reset_at),
+        "fetched_at": isoformat(utc_now()),
+        "source": "grok.com gRPC-web",
+    }
+
+
+def fetch_live(token: str) -> dict:
+    request = urllib.request.Request(
+        ENDPOINT,
+        data=b"\x00\x00\x00\x00\x00",
+        method="POST",
+        headers={
+            "Origin": "https://grok.com",
+            "Referer": "https://grok.com/?_s=usage",
+            "Accept": "*/*",
+            "Content-Type": "application/grpc-web+proto",
+            "x-grpc-web": "1",
+            "x-user-agent": "connect-es/2.1.1",
+            "User-Agent": "grok-credits/1.0",
+            "Authorization": f"Bearer {token}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=12) as response:
+            body = response.read()
+            headers = {k.lower(): v for k, v in response.headers.items()}
+    except urllib.error.HTTPError as exc:
+        detail = exc.read(300).decode("utf-8", errors="ignore")
+        if exc.code in (401, 403):
+            raise CreditsError(
+                f"Auth rejected (HTTP {exc.code}). Run `grok login` and retry."
+            ) from exc
+        raise CreditsError(f"HTTP {exc.code}: {detail}") from exc
+    except Exception as exc:
+        raise CreditsError(f"Network error: {exc}") from exc
+
+    status = headers.get("grpc-status")
+    if status and status != "0":
+        raise CreditsError(f"gRPC status {status}: {headers.get('grpc-message', '')}")
+
+    return parse_billing(body)
+
+
+def fetch_subscription(token: str) -> dict:
+    """Return next subscription period end / auto-renew from grok.com REST API."""
+    request = urllib.request.Request(
+        SUBSCRIPTIONS_URL,
+        method="GET",
+        headers={
+            "Origin": "https://grok.com",
+            "Referer": "https://grok.com/",
+            "Accept": "application/json",
+            "User-Agent": "grok-credits/1.0",
+            "Authorization": f"Bearer {token}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=12) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return {}
+
+    subs = data.get("subscriptions") if isinstance(data, dict) else None
+    if not isinstance(subs, list):
+        return {}
+
+    active = None
+    for sub in subs:
+        if not isinstance(sub, dict):
+            continue
+        if sub.get("status") == "SUBSCRIPTION_STATUS_ACTIVE":
+            active = sub
+            break
+    if active is None:
+        # fall back to the latest period end among any known subs
+        candidates = [s for s in subs if isinstance(s, dict) and s.get("billingPeriodEnd")]
+        if not candidates:
+            return {}
+        active = max(candidates, key=lambda s: str(s.get("billingPeriodEnd") or ""))
+
+    end = active.get("billingPeriodEnd")
+    if not isinstance(end, str) or not end:
+        return {}
+    auto = not bool(active.get("cancelAtPeriodEnd"))
+    # Apple field can reinforce auto-renew
+    apple = active.get("apple") if isinstance(active.get("apple"), dict) else {}
+    if "autoRenewOn" in apple:
+        auto = bool(apple.get("autoRenewOn"))
+    return {
+        "next_subscription_at": end if end.endswith("Z") else end,
+        "subscription_auto_renew": auto,
+        "subscription_tier": active.get("tier"),
+        "subscription_interval": active.get("billingInterval"),
+    }
+
+
+def load_cache() -> dict | None:
+    path = cache_file()
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    fetched = data.get("fetched_at")
+    if not fetched:
+        return None
+    try:
+        ts = dt.datetime.fromisoformat(fetched.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    age = (utc_now() - ts.astimezone(dt.timezone.utc)).total_seconds()
+    if age < 0 or age > CACHE_TTL_SECS:
+        return None
+    return data
+
+
+def save_cache(data: dict) -> None:
+    path = cache_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(data, indent=2, sort_keys=True) + "\n"
+    # Atomic write
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".credits.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+        os.replace(tmp, path)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def get_credits(use_cache: bool = True) -> dict:
+    if use_cache:
+        cached = load_cache()
+        if cached is not None:
+            cached = dict(cached)
+            cached["from_cache"] = True
+            return cached
+
+    token, meta = load_token()
+    billing = fetch_live(token)
+    sub = fetch_subscription(token)
+    result = {
+        **billing,
+        **sub,
+        "email": meta.get("email"),
+        "team_id": meta.get("team_id"),
+        "auth_mode": meta.get("auth_mode"),
+        "token_expires_at": meta.get("expires_at"),
+        "from_cache": False,
+    }
+    try:
+        save_cache(result)
+    except Exception:
+        pass
+    return result
+
+
+def fmt_percent(value: float) -> str:
+    text = f"{value:.1f}".rstrip("0").rstrip(".")
+    return f"{text}%"
+
+
+def local_reset_text(iso: str | None) -> str | None:
+    if not iso:
+        return None
+    try:
+        when = dt.datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except ValueError:
+        return iso
+    local = when.astimezone()
+    return local.strftime("%b %-d %H:%M")
+
+
+def short_line(data: dict) -> str:
+    left = data["monthly_remaining_percent"]
+    used = data["monthly_used_percent"]
+    reset = local_reset_text(data.get("resets_at"))
+    parts = [f"Grok credits {fmt_percent(left)} left", f"used {fmt_percent(used)}"]
+    if reset:
+        parts.append(f"reset {reset}")
+    return " · ".join(parts)
+
+
+def title_line(data: dict) -> str:
+    left = data["monthly_remaining_percent"]
+    used = data["monthly_used_percent"]
+    reset = local_reset_text(data.get("resets_at"))
+    # Keep title compact for tab bars
+    base = f"Grok · {fmt_percent(left)} left ({fmt_percent(used)} used)"
+    if reset:
+        base += f" · ↻ {reset}"
+    return base
+
+
+def print_human(data: dict) -> None:
+    print("=== Grok Credit Balance ===")
+    if data.get("email"):
+        print(f"Account:  {data['email']}")
+    print(f"Used:     {fmt_percent(data['monthly_used_percent'])}")
+    print(f"Left:     {fmt_percent(data['monthly_remaining_percent'])}")
+    reset = local_reset_text(data.get("resets_at"))
+    if reset:
+        print(f"Resets:   {reset} (local)")
+    elif data.get("resets_at"):
+        print(f"Resets:   {data['resets_at']}")
+    cache_note = "cached" if data.get("from_cache") else "live"
+    print(f"Fetched:  {data.get('fetched_at')} ({cache_note})")
+    print()
+    print("Tip: built-in `/usage` also shows prepaid credits & auto top-up.")
+    print("     Window title is auto-updated via ~/.grok/hooks/credits-status.json")
+
+
+def write_terminal_title(title: str) -> None:
+    # OSC 0/2 sets icon name + window title. Write to /dev/tty so hooks still work
+    # when stdout is captured by the hook runner.
+    payload = f"\033]0;{title}\007"
+    targets = []
+    for stream in (sys.stderr, sys.stdout):
+        try:
+            if stream.isatty():
+                targets.append(stream)
+        except Exception:
+            pass
+    try:
+        targets.append(open("/dev/tty", "w"))
+    except Exception:
+        pass
+
+    written = False
+    for stream in targets:
+        try:
+            stream.write(payload)
+            stream.flush()
+            written = True
+            break
+        except Exception:
+            continue
+    if not written:
+        # Last resort: still emit on stdout for shells that pass it through
+        sys.stdout.write(payload)
+        sys.stdout.flush()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Show Grok Build credit balance")
+    parser.add_argument("--json", action="store_true", help="Print JSON")
+    parser.add_argument("--short", action="store_true", help="One-line summary")
+    parser.add_argument(
+        "--title",
+        action="store_true",
+        help="Update terminal window title and print short line",
+    )
+    parser.add_argument(
+        "--title-only",
+        action="store_true",
+        help="Update terminal window title only (for hooks)",
+    )
+    parser.add_argument("--no-cache", action="store_true", help="Bypass cache")
+    args = parser.parse_args()
+
+    try:
+        data = get_credits(use_cache=not args.no_cache)
+    except CreditsError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        if args.title or args.title_only:
+            write_terminal_title("Grok · credits unavailable")
+        return 1
+
+    if args.title or args.title_only:
+        write_terminal_title(title_line(data))
+        if args.title_only:
+            return 0
+        if not args.json:
+            print(short_line(data))
+            return 0
+
+    if args.json:
+        print(json.dumps(data, indent=2, sort_keys=True))
+    elif args.short:
+        print(short_line(data))
+    else:
+        print_human(data)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

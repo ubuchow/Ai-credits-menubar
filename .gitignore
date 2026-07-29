@@ -1,0 +1,30 @@
+# Secrets & local auth (NEVER commit)
+**/.env
+**/.env.*
+**/auth.json
+**/credentials*
+**/*token*
+**/*secret*
+**/*password*
+**/*.pem
+**/*.key
+**/id_rsa*
+**/.codex/
+**/.grok/
+**/mcp_credentials.json
+
+# Build / IDE
+.DS_Store
+*.app/
+DerivedData/
+.build/
+.swiftpm/
+*.xcuserstate
+.idea/
+.vscode/
+__pycache__/
+*.pyc
+
+# Logs
+*.log
+Library/

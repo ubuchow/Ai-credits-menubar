@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+"""Low-memory Codex today/month token totals.
+
+Streams rollout JSONL files and sums last_token_usage.total_tokens for
+token_count events by event timestamp. Prints one JSON line:
+  {"today": <int>, "month": <int>}
+
+Uses an on-disk per-file offset cache so subsequent runs only read appended
+bytes. Designed to run as a short-lived helper so the menubar process never
+holds multi-GB scan working set.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+TOKEN_RE = re.compile(
+    rb'"last_token_usage"\s*:\s*\{[^}]{0,800}?"total_tokens"\s*:\s*(\d+)'
+)
+TS_RE = re.compile(rb'"timestamp"\s*:\s*"([^"]+)"')
+FNAME_RE = re.compile(r"rollout-(\d{4})-(\d{2})-(\d{2})")
+TOKEN_MARK = b'"token_count"'
+LAST_MARK = b'"last_token_usage"'
+MAX_LINE = 120_000  # real token_count lines are small; skip tool-dump giants
+
+
+def codex_home() -> Path:
+    env = os.environ.get("CODEX_HOME")
+    if env:
+        return Path(os.path.expanduser(env))
+    return Path.home() / ".codex"
+
+
+def cache_path() -> Path:
+    base = Path.home() / "Library" / "Caches" / "CodexCreditsMenuBar"
+    base.mkdir(parents=True, exist_ok=True)
+    return base / "token-scan-cache.json"
+
+
+def parse_iso(ts: str) -> datetime | None:
+    try:
+        if ts.endswith("Z"):
+            ts = ts[:-1] + "+00:00"
+        return datetime.fromisoformat(ts)
+    except Exception:
+        return None
+
+
+def local_day_bounds() -> tuple[datetime, datetime, str, str]:
+    # Use local timezone of the machine
+    now = datetime.now().astimezone()
+    start_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_month = start_day.replace(day=1)
+    day_key = start_day.strftime("%Y-%m-%d")
+    month_key = start_day.strftime("%Y-%m")
+    return start_day, start_month, day_key, month_key
+
+
+def list_rollouts(home: Path) -> list[Path]:
+    files: list[Path] = []
+    sessions = home / "sessions"
+    archived = home / "archived_sessions"
+    if sessions.is_dir():
+        files.extend(sessions.rglob("rollout-*.jsonl"))
+    if archived.is_dir():
+        files.extend(archived.glob("rollout-*.jsonl"))
+    return files
+
+
+def should_scan(path: Path, start_month: datetime, scan_from: datetime) -> bool:
+    name = path.name
+    m = FNAME_RE.search(name)
+    file_start = None
+    if m:
+        try:
+            file_start = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3))).astimezone()
+        except Exception:
+            file_start = None
+    try:
+        mtime = datetime.fromtimestamp(path.stat().st_mtime).astimezone()
+    except OSError:
+        return False
+    if file_start is not None and file_start < scan_from and mtime < start_month:
+        return False
+    return True
+
+
+def extract_event(line: bytes) -> tuple[datetime, int] | None:
+    if TOKEN_MARK not in line or LAST_MARK not in line:
+        return None
+    if len(line) > MAX_LINE:
+        return None
+    # timestamp near start
+    head = line[:180]
+    tm = TS_RE.search(head)
+    if not tm:
+        return None
+    ts = parse_iso(tm.group(1).decode("utf-8", "ignore"))
+    if ts is None:
+        return None
+    # last_token_usage window
+    idx = line.find(LAST_MARK)
+    if idx < 0:
+        return None
+    window = line[idx : idx + 600]
+    km = TOKEN_RE.search(window)
+    if not km:
+        return None
+    tokens = int(km.group(1))
+    if tokens <= 0:
+        return None
+    return ts, tokens
+
+
+def scan_file(
+    path: Path,
+    offset: int,
+    start_day: datetime,
+    start_month: datetime,
+) -> tuple[int, int, int, int]:
+    """Returns (today_delta, month_delta, new_offset, size)."""
+    try:
+        st = path.stat()
+    except OSError:
+        return 0, 0, 0, 0
+    size = st.st_size
+    if offset > size:
+        offset = 0
+    today = month = 0
+    with path.open("rb") as f:
+        if offset:
+            f.seek(offset)
+        leftover = b""
+        pos = offset
+        while True:
+            chunk = f.read(256 * 1024)
+            if not chunk and not leftover:
+                break
+            data = leftover + chunk if leftover else chunk
+            leftover = b""
+            start = 0
+            while True:
+                nl = data.find(b"\n", start)
+                if nl < 0:
+                    break
+                line = data[start:nl]
+                start = nl + 1
+                pos += len(line) + 1
+                ev = extract_event(line)
+                if not ev:
+                    continue
+                ts, tokens = ev
+                # compare in aware local/UTC consistently
+                if ts.tzinfo is None:
+                    ts = ts.astimezone()
+                if ts >= start_month:
+                    month += tokens
+                    if ts >= start_day:
+                        today += tokens
+            if start < len(data):
+                leftover = data[start:]
+                if len(leftover) > 2_000_000:
+                    pos += len(leftover)
+                    leftover = b""
+            if not chunk:
+                break
+        new_offset = size - len(leftover)
+    return today, month, new_offset, size
+
+
+def main() -> int:
+    start_day, start_month, day_key, month_key = local_day_bounds()
+    # sessions started late last month may still emit events this month
+    from datetime import timedelta
+
+    scan_from = start_month - timedelta(days=40)
+
+    cpath = cache_path()
+    cache: dict = {}
+    if cpath.is_file():
+        try:
+            cache = json.loads(cpath.read_text())
+        except Exception:
+            cache = {}
+
+    if cache.get("day_key") != day_key or cache.get("month_key") != month_key:
+        cache = {"day_key": day_key, "month_key": month_key, "files": {}}
+
+    files_cache: dict = cache.setdefault("files", {})
+    home = codex_home()
+    paths = [p for p in list_rollouts(home) if should_scan(p, start_month, scan_from)]
+    seen: set[str] = set()
+
+    for path in paths:
+        key = str(path)
+        seen.add(key)
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        entry = files_cache.get(key) or {
+            "size": 0,
+            "mtime": 0.0,
+            "offset": 0,
+            "today": 0,
+            "month": 0,
+        }
+        size = st.st_size
+        mtime = st.st_mtime
+        offset = int(entry.get("offset") or 0)
+        # truncated / rewritten
+        if size < offset or (offset > 0 and mtime + 1 < float(entry.get("mtime") or 0)):
+            entry = {"size": 0, "mtime": 0.0, "offset": 0, "today": 0, "month": 0}
+            offset = 0
+        # unchanged
+        if size == int(entry.get("size") or 0) and abs(mtime - float(entry.get("mtime") or 0)) < 0.001 and offset >= size:
+            files_cache[key] = entry
+            continue
+
+        td, md, new_off, new_size = scan_file(path, offset, start_day, start_month)
+        if offset == 0:
+            entry["today"] = td
+            entry["month"] = md
+        else:
+            entry["today"] = int(entry.get("today") or 0) + td
+            entry["month"] = int(entry.get("month") or 0) + md
+        entry["offset"] = new_off
+        entry["size"] = new_size
+        entry["mtime"] = mtime
+        files_cache[key] = entry
+
+    # drop deleted
+    for k in list(files_cache.keys()):
+        if k not in seen:
+            del files_cache[k]
+
+    today = sum(int(v.get("today") or 0) for v in files_cache.values())
+    month = sum(int(v.get("month") or 0) for v in files_cache.values())
+    cache["day_key"] = day_key
+    cache["month_key"] = month_key
+    cache["files"] = files_cache
+    cache["updated_at"] = time.time()
+    try:
+        cpath.write_text(json.dumps(cache, separators=(",", ":")))
+    except Exception:
+        pass
+
+    sys.stdout.write(json.dumps({"today": today, "month": month}, separators=(",", ":")))
+    sys.stdout.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
