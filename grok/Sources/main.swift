@@ -1017,29 +1017,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func apply(_ info: CreditsInfo) {
-        lastInfo = info
+        // Token stats always come from local logs (independent of billing API).
+        var merged = info
+        merged.tokensToday = info.tokensToday ?? lastInfo.tokensToday
+        merged.tokensMonth = info.tokensMonth ?? lastInfo.tokensMonth
 
-        // Token stats come from local logs and can still show when credits API fails.
-        tokensTodayItem.title = "今日 Token: \(info.tokensTodayText)"
-        tokensMonthItem.title = "本月 Token: \(info.tokensMonthText)"
+        // Keep last good remaining % when live billing fails — never stick on '?' if we
+        // previously had a successful fetch in this process.
+        if merged.remainingPercent == nil, let prev = lastInfo.remainingPercent {
+            merged.remainingPercent = prev
+            merged.resetsAt = merged.resetsAt ?? lastInfo.resetsAt
+            merged.nextSubscriptionAt = merged.nextSubscriptionAt ?? lastInfo.nextSubscriptionAt
+            merged.subscriptionAutoRenew = merged.subscriptionAutoRenew ?? lastInfo.subscriptionAutoRenew
+            merged.email = merged.email ?? lastInfo.email
+            merged.fromCache = true
+        }
 
-        if let err = info.error {
+        lastInfo = merged
+
+        tokensTodayItem.title = "今日 Token: \(merged.tokensTodayText)"
+        tokensMonthItem.title = "本月 Token: \(merged.tokensMonthText)"
+
+        if let err = merged.error, merged.remainingPercent == nil {
             remainingItem.title = "余量: 获取失败"
             resetItem.title = "重置: —"
             subscriptionItem.title = "下次订阅: —"
             detailItem.title = "错误: \(String(err.prefix(40)))"
-            log("fetch error: \(err) tokens_today=\(info.tokensTodayText) tokens_month=\(info.tokensMonthText)")
+            log("fetch error: \(err) tokens_today=\(merged.tokensTodayText) tokens_month=\(merged.tokensMonthText)")
         } else {
-            remainingItem.title = "余量: \(info.remainingText)"
-            resetItem.title = "重置: \(info.resetText)"
-            subscriptionItem.title = info.nextSubscriptionMenuTitle
+            remainingItem.title = "余量: \(merged.remainingText)"
+            resetItem.title = "重置: \(merged.resetText)"
+            subscriptionItem.title = merged.nextSubscriptionMenuTitle
             let now = DateFormatter()
             now.dateFormat = "HH:mm:ss"
-            let cache = info.fromCache ? "缓存" : "实时"
-            detailItem.title = "更新: \(now.string(from: Date())) (\(cache))"
-            log(
-                "updated remaining=\(info.remainingText) reset=\(info.resetText) sub=\(info.nextSubscriptionText) tokens_today=\(info.tokensTodayText) tokens_month=\(info.tokensMonthText)"
-            )
+            let cache = merged.fromCache ? "缓存" : "实时"
+            let warn = merged.error != nil ? " · 警告" : ""
+            detailItem.title = "更新: \(now.string(from: Date())) (\(cache))\(warn)"
+            if let err = merged.error {
+                log("fetch warning (kept last remaining): \(err) remaining=\(merged.remainingText)")
+            } else {
+                log(
+                    "updated remaining=\(merged.remainingText) reset=\(merged.resetText) sub=\(merged.nextSubscriptionText) tokens_today=\(merged.tokensTodayText) tokens_month=\(merged.tokensMonthText)"
+                )
+            }
         }
         updateStatusAppearance()
     }

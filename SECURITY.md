@@ -8,12 +8,17 @@
 
 ## 运行时凭证（仅在你自己电脑上）
 
-| 应用 | 本机读取 | 是否上传到本仓库 / 作者 |
+| 组件 | 本机读取 | 是否上传到本仓库 / 作者 |
 |------|----------|-------------------------|
-| Grok Credits | 通过 `grok-credits` 读 `~/.grok/auth.json` | 否，仅本地 |
-| Codex Credits | 读 `~/.codex/auth.json` 中的 access token | 否，仅本地 |
+| **AI Credits**（`combined/`，推荐） | 通过 `grok-credits` 读 `~/.grok/auth.json`；读 `~/.codex/auth.json` | 否，仅本地 |
+| Grok 独立应用 / 脚本（`grok/`） | 通过 `grok-credits` 读 `~/.grok/auth.json` | 否，仅本地 |
+| Codex 独立应用 / 脚本（`codex/`） | 读 `~/.codex/auth.json` 中的 access token | 否，仅本地 |
 
 Token 始终保存在用户磁盘。应用仅用**用户自己的**登录态调用官方用量相关接口；仓库维护者收不到任何凭证。
+
+## 日志
+
+统一应用可将标准输出/错误写到本机 `~/Library/Logs/AICreditsMenuBar/`（由 LaunchAgent 配置）。日志仅供本机排查，不上传。
 
 ## 发现问题
 

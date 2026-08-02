@@ -212,6 +212,7 @@ def parse_billing(data: bytes) -> dict:
         varints.extend(v)
         fixed32.extend(f)
 
+    # Historical layout: used% as float32 at path ending in field 1 (often [1,1]).
     candidates = [
         field
         for field in fixed32
@@ -220,24 +221,56 @@ def parse_billing(data: bytes) -> dict:
     candidates.sort(key=lambda field: (len(field["path"]), field["order"]))
     preferred = [c for c in candidates if c["path"] == [1, 1]]
     ordered = preferred or candidates
+    # Any finite 0–100 float32 in the payload (API field numbers drift).
+    any_pct = [
+        field
+        for field in fixed32
+        if 0 <= field["value"] <= 100 and math.isfinite(field["value"])
+    ]
+    any_pct.sort(key=lambda field: (len(field["path"]), field["order"]))
 
     now = utc_now()
+    # Period start / end as unix seconds (and optional nanos as sibling field 2).
+    period_starts: list[dt.datetime] = []
     reset_candidates: list[tuple[list[int], dt.datetime]] = []
     for field in varints:
         raw = field["value"]
-        if 1_700_000_000 <= raw <= 2_100_000_000:
-            date = dt.datetime.fromtimestamp(raw, dt.timezone.utc)
-            if date > now:
-                reset_candidates.append((field["path"], date))
+        if not (1_700_000_000 <= raw <= 2_100_000_000):
+            continue
+        date = dt.datetime.fromtimestamp(raw, dt.timezone.utc)
+        path = field["path"]
+        # [1,4,1] period start, [1,5,1] next reset (current API)
+        if path[-1:] == [1] and len(path) >= 2 and path[-2] in (4, 5, 6):
+            if path[-2] in (4,):
+                period_starts.append(date)
+            if date > now - dt.timedelta(days=1):
+                # allow just-passed start; only future (or near-future) for reset_at
+                if date > now:
+                    reset_candidates.append((path, date))
+        elif date > now:
+            reset_candidates.append((path, date))
 
-    preferred_resets = [d for p, d in reset_candidates if p == [1, 5, 1]]
+    preferred_resets = [
+        d
+        for p, d in reset_candidates
+        if p == [1, 5, 1] or (len(p) >= 2 and p[-2:] == [5, 1])
+    ]
     all_resets = [d for _, d in reset_candidates]
     reset_at = min(preferred_resets or all_resets) if (preferred_resets or all_resets) else None
 
-    has_local_reset = any(field["path"][:2] == [1, 6] for field in varints)
+    # Window markers present in current responses even when % floats are omitted.
+    has_window = any(
+        len(field["path"]) >= 2 and field["path"][0] == 1 and field["path"][1] in (4, 5, 6, 8)
+        for field in varints
+    )
+
     if ordered:
         used_percent = float(ordered[0]["value"])
-    elif not fixed32 and reset_at and has_local_reset:
+    elif any_pct:
+        used_percent = float(any_pct[0]["value"])
+    elif not fixed32 and (reset_at or has_window or period_starts):
+        # After a period reset the API often returns empty length-delimited
+        # usage fields and only timestamps — treat as 0% used (100% left).
         used_percent = 0.0
     else:
         raise CreditsError("Could not parse credit usage from billing response")
@@ -343,7 +376,13 @@ def fetch_subscription(token: str) -> dict:
     }
 
 
-def load_cache() -> dict | None:
+def load_cache(*, allow_stale: bool = False) -> dict | None:
+    """Load cached credits. Fresh cache respects CACHE_TTL_SECS.
+
+    When allow_stale=True, return the last good payload even if expired — used
+    as a fallback when the live billing request fails so the menu bar never
+    flips to '?' solely due to a transient parse/network error.
+    """
     path = cache_file()
     if not path.exists():
         return None
@@ -351,15 +390,21 @@ def load_cache() -> dict | None:
         data = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
+    if not isinstance(data, dict):
+        return None
+    if data.get("monthly_remaining_percent") is None:
+        return None
     fetched = data.get("fetched_at")
     if not fetched:
-        return None
+        return data if allow_stale else None
     try:
         ts = dt.datetime.fromisoformat(fetched.replace("Z", "+00:00"))
     except ValueError:
-        return None
+        return data if allow_stale else None
     age = (utc_now() - ts.astimezone(dt.timezone.utc)).total_seconds()
-    if age < 0 or age > CACHE_TTL_SECS:
+    if age < 0:
+        return data if allow_stale else None
+    if age > CACHE_TTL_SECS and not allow_stale:
         return None
     return data
 
@@ -388,14 +433,25 @@ def save_cache(data: dict) -> None:
 
 def get_credits(use_cache: bool = True) -> dict:
     if use_cache:
-        cached = load_cache()
+        cached = load_cache(allow_stale=False)
         if cached is not None:
             cached = dict(cached)
             cached["from_cache"] = True
             return cached
 
     token, meta = load_token()
-    billing = fetch_live(token)
+    try:
+        billing = fetch_live(token)
+    except CreditsError:
+        # Prefer last known-good over hard failure (menu bar '?' is worse UX).
+        stale = load_cache(allow_stale=True)
+        if stale is not None:
+            stale = dict(stale)
+            stale["from_cache"] = True
+            stale["stale"] = True
+            return stale
+        raise
+
     sub = fetch_subscription(token)
     result = {
         **billing,
