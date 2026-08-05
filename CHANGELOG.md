@@ -1,5 +1,21 @@
 # 更新日志
 
+## 2.1.0 — 2026-08-05
+
+### 新增
+
+- **第三路 Hermes（DeepSeek）**：`hermes-balance` 拉余额与 Token/busy；菜单栏 H 圆显示整数余额  
+- **三角芯片**：上 G · 左下 H · 右下 C，数字贴在圆旁（G/C 右、H 左），圆可 30% 交叉、直径 12pt  
+- **应用图标**：`assets/AppIcon.icns`（与 G/H/C 主题一致），`generate-app-icon.py` 可重生成  
+
+### 改进
+
+- 数字 Times New Roman、黑色；圆内字母 Times New Roman  
+- Hermes 余额菜单栏仅整数；低余量警示色保留  
+- 文档与安装文案同步为三 agent  
+
+---
+
 ## 2.0.0 — 2026-07-31
 
 ### 新增

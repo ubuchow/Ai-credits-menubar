@@ -2,68 +2,83 @@ import AppKit
 import AVFoundation
 import Foundation
 
-// MARK: - Compact dual chip (one menubar slot)
+// MARK: - Triangle triple chip (G top · H left · C right)
 
-/// Dense stacked layout:
+/// One menubar image: overlapping triangle of three badges with numbers.
 /// ```
-///  ⬤G 95     Grok  — light disc + dark G + black number
-///  ⬤C 78     Codex — amber gold disc + dark C + gold number
+///        ⬤G 46
+///     88 ⬤H⬤C 44   (circles may intersect)
 /// ```
 enum MenuBarChip {
     private static var cache: [String: NSImage] = [:]
 
-    // Grok — monochrome
+    // Grok — monochrome light disc
     private static let gDisc = NSColor(calibratedWhite: 0.96, alpha: 1)
     private static let gInk = NSColor(calibratedWhite: 0.08, alpha: 1)
-    // Numbers: deep red — high contrast on dark menubar
-    private static let gNum = NSColor(
-        srgbRed: 0.72,
-        green: 0.12,
-        blue: 0.14,
-        alpha: 1
-    )
-    private static let gRim = NSColor(calibratedWhite: 0.45, alpha: 0.65)
-    // Codex — amber gold badge (distinct from G)
-    private static let cDisc = NSColor(
-        srgbRed: 0.92,
-        green: 0.68,
-        blue: 0.22,
-        alpha: 1
-    )
+    // Hermes — deep indigo (distinct)
+    private static let hDisc = NSColor(srgbRed: 0.35, green: 0.40, blue: 0.78, alpha: 1)
+    private static let hInk = NSColor.white
+    // Codex — amber gold
+    private static let cDisc = NSColor(srgbRed: 0.92, green: 0.68, blue: 0.22, alpha: 1)
     private static let cInk = NSColor(calibratedWhite: 0.10, alpha: 1)
-    private static let cNum = NSColor(
-        srgbRed: 0.72,
-        green: 0.12,
-        blue: 0.14,
-        alpha: 1
-    )
+    // Numbers — black
+    private static let numColor = NSColor.black
     private static let warnFill = NSColor(calibratedRed: 0.78, green: 0.32, blue: 0.32, alpha: 1)
     private static let warnOn = NSColor.white
 
-    private static let chipHeight: CGFloat = 18
-    private static let badge: CGFloat = 9.0
-    private static let rowGap: CGFloat = 0.8
-    private static let badgeToNum: CGFloat = 2.0
-    private static let numColMin: CGFloat = 14
+    private static let chipHeight: CGFloat = 22
+    /// Badge diameter (pt).
+    private static let badge: CGFloat = 12.0
+    /// Linear overlap fraction: centerDist = diameter × (1 − overlap).
+    private static let overlap: CGFloat = 0.30
+    private static let badgeToNum: CGFloat = 1.0
 
     static func image(
         grokText: String,
+        hermesText: String,
         codexText: String,
         grokLow: Bool = false,
+        hermesLow: Bool = false,
         codexLow: Bool = false,
         showG: Bool = true,
+        showH: Bool = true,
         showC: Bool = true
     ) -> NSImage {
-        let key = "v5|\(grokText)|\(codexText)|\(grokLow)|\(codexLow)|\(showG)|\(showC)"
+        let key = "tri7|\(grokText)|\(hermesText)|\(codexText)|\(grokLow)|\(hermesLow)|\(codexLow)|\(showG)|\(showH)|\(showC)"
         if let hit = cache[key] { return hit }
 
         let scale = NSScreen.main?.backingScaleFactor ?? 2
-        let numFont = MenuBarPercentFont.bold(size: 9.0)
-        let gSize = (grokText as NSString).size(withAttributes: [.font: numFont])
-        let cSize = (codexText as NSString).size(withAttributes: [.font: numFont])
-        let numW = max(numColMin, ceil(max(gSize.width, cSize.width)))
-        let width = badge + badgeToNum + numW + 0.5
+        let numFont = MenuBarPercentFont.font(size: 7.0)
+        let gNumW = ceil((grokText as NSString).size(withAttributes: [.font: numFont]).width)
+        let hNumW = ceil((hermesText as NSString).size(withAttributes: [.font: numFont]).width)
+        let cNumW = ceil((codexText as NSString).size(withAttributes: [.font: numFont]).width)
+
+        // Layout:  [Hnum] ⬤H⬤C [Cnum]
+        //                 ⬤G [Gnum]   (≈equilateral, 30% linear overlap)
         let height = chipHeight
+        let r = badge * 0.5
+        let centerDist = badge * (1 - overlap) // 12 × 0.70 = 8.4
+        let botY: CGFloat = 0.15
+        let hCenterY = botY + r
+        // Vertical rise for equilateral triangle with same center distance
+        let halfBase = centerDist * 0.5
+        let rise = sqrt(max(0, centerDist * centerDist - halfBase * halfBase))
+        var gCenterY = hCenterY + rise
+        // Keep badge inside chip
+        let maxGCenterY = height - 0.15 - r
+        if gCenterY > maxGCenterY { gCenterY = maxGCenterY }
+        let gBadgeY = gCenterY - r
+
+        let hBadgeX = hNumW + badgeToNum
+        let hCenterX = hBadgeX + r
+        let cCenterX = hCenterX + centerDist
+        let cBadgeX = cCenterX - r
+        let gCenterX = (hCenterX + cCenterX) * 0.5
+        let gBadgeX = gCenterX - r
+
+        let gNumX = gBadgeX + badge + badgeToNum
+        let cNumX = cBadgeX + badge + badgeToNum
+        let width = max(cNumX + cNumW, gNumX + gNumW) + 0.5
 
         let pxW = Int(ceil(width * scale))
         let pxH = Int(ceil(height * scale))
@@ -82,84 +97,51 @@ enum MenuBarChip {
         rep.size = NSSize(width: width, height: height)
         NSGraphicsContext.saveGraphicsState()
         NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
-
         NSColor.clear.setFill()
         NSRect(x: 0, y: 0, width: width, height: height).fill()
 
-        let blockH = badge * 2 + rowGap
-        let blockY = (height - blockH) * 0.5
-        let topRowY = blockY + badge + rowGap
-        let botRowY = blockY
-
-        // Top — Grok (mono)
-        drawRow(
-            letter: "G",
-            text: grokText,
-            low: grokLow,
-            showLetter: showG,
-            rowY: topRowY,
-            numFont: numFont,
-            disc: gDisc,
-            letterColor: gInk,
-            numColor: gNum,
-            rim: gRim
+        // Draw back-to-front so the top of the triangle (G) stays most legible
+        drawBadge(
+            letter: "H",
+            fill: hermesLow ? warnFill : hDisc,
+            letterColor: hermesLow ? warnOn : hInk,
+            rim: hermesLow ? warnFill.blended(withFraction: 0.25, of: .black) : hDisc.blended(withFraction: 0.28, of: .black),
+            showLetter: showH,
+            badgeRect: NSRect(x: hBadgeX, y: botY, width: badge, height: badge)
         )
-        // Bottom — Codex (green)
-        drawRow(
+        drawBadge(
             letter: "C",
-            text: codexText,
-            low: codexLow,
+            fill: codexLow ? warnFill : cDisc,
+            letterColor: codexLow ? warnOn : cInk,
+            rim: codexLow ? warnFill.blended(withFraction: 0.25, of: .black) : cDisc.blended(withFraction: 0.28, of: .black),
             showLetter: showC,
-            rowY: botRowY,
-            numFont: numFont,
-            disc: cDisc,
-            letterColor: cInk,
-            numColor: cNum,
-            rim: cDisc.blended(withFraction: 0.22, of: .black)
+            badgeRect: NSRect(x: cBadgeX, y: botY, width: badge, height: badge)
         )
+        drawBadge(
+            letter: "G",
+            fill: grokLow ? warnFill : gDisc,
+            letterColor: grokLow ? warnOn : gInk,
+            rim: grokLow ? warnFill.blended(withFraction: 0.25, of: .black) : NSColor(calibratedWhite: 0.38, alpha: 0.75),
+            showLetter: showG,
+            badgeRect: NSRect(x: gBadgeX, y: gBadgeY, width: badge, height: badge)
+        )
+
+        // Numbers sit outside the cluster: H left · G right · C right
+        let gColor = grokLow ? warnFill : numColor
+        let hColor = hermesLow ? warnFill : numColor
+        let cColor = codexLow ? warnFill : numColor
+        drawNumber(hermesText, right: hBadgeX - badgeToNum, centerY: hCenterY, font: numFont, color: hColor)
+        drawNumber(grokText, x: gNumX, centerY: gCenterY, font: numFont, color: gColor)
+        drawNumber(codexText, x: cNumX, centerY: hCenterY, font: numFont, color: cColor)
 
         NSGraphicsContext.restoreGraphicsState()
-
         let img = NSImage(size: NSSize(width: width, height: height))
         img.addRepresentation(rep)
         img.isTemplate = false
         img.cacheMode = .always
-        if cache.count > 80 { cache.removeAll(keepingCapacity: true) }
+        if cache.count > 100 { cache.removeAll(keepingCapacity: true) }
         cache[key] = img
         return img
-    }
-
-    private static func drawRow(
-        letter: String,
-        text: String,
-        low: Bool,
-        showLetter: Bool,
-        rowY: CGFloat,
-        numFont: NSFont,
-        disc: NSColor,
-        letterColor: NSColor,
-        numColor: NSColor,
-        rim: NSColor?
-    ) {
-        let fill = low ? warnFill : disc
-        let letterCol = low ? warnOn : letterColor
-        let numCol = low ? warnFill : numColor
-        let rimCol = low ? warnFill.blended(withFraction: 0.2, of: .black) : rim
-        drawBadge(
-            letter: letter,
-            fill: fill,
-            letterColor: letterCol,
-            rim: rimCol,
-            showLetter: showLetter,
-            badgeRect: NSRect(x: 0, y: rowY, width: badge, height: badge)
-        )
-        drawNumber(
-            text,
-            x: badge + badgeToNum,
-            centerY: rowY + badge * 0.5,
-            font: numFont,
-            color: numCol
-        )
     }
 
     private static func drawBadge(
@@ -170,7 +152,7 @@ enum MenuBarChip {
         showLetter: Bool,
         badgeRect: NSRect
     ) {
-        let inset = badgeRect.insetBy(dx: 0.2, dy: 0.2)
+        let inset = badgeRect.insetBy(dx: 0.12, dy: 0.12)
         if showLetter {
             fill.setFill()
             NSBezierPath(ovalIn: inset).fill()
@@ -180,7 +162,8 @@ enum MenuBarChip {
                 edge.lineWidth = 0.7
                 edge.stroke()
             }
-            let font = MenuBarPercentFont.bold(size: badge * 0.64)
+            // Slightly smaller letter so it stays clear when discs overlap
+            let font = MenuBarPercentFont.bold(size: badge * 0.56)
             let text = letter as NSString
             let attrs: [NSAttributedString.Key: Any] = [
                 .font: font,
@@ -189,7 +172,7 @@ enum MenuBarChip {
             let size = text.size(withAttributes: attrs)
             let origin = NSPoint(
                 x: inset.midX - size.width * 0.5,
-                y: inset.midY - size.height * 0.5 + 0.12
+                y: inset.midY - size.height * 0.5 + 0.1
             )
             text.draw(at: origin, withAttributes: attrs)
         } else {
@@ -214,6 +197,42 @@ enum MenuBarChip {
         ]
         let size = text.size(withAttributes: attrs)
         let origin = NSPoint(x: x, y: centerY - size.height * 0.5)
+        text.draw(at: origin, withAttributes: attrs)
+    }
+
+    /// Centered number (horizontal center at `centerX`).
+    private static func drawNumber(
+        _ s: String,
+        centerX: CGFloat,
+        centerY: CGFloat,
+        font: NSFont,
+        color: NSColor
+    ) {
+        let text = s as NSString
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: color,
+        ]
+        let size = text.size(withAttributes: attrs)
+        let origin = NSPoint(x: centerX - size.width * 0.5, y: centerY - size.height * 0.5)
+        text.draw(at: origin, withAttributes: attrs)
+    }
+
+    /// Right-aligned number (trailing edge at `right`).
+    private static func drawNumber(
+        _ s: String,
+        right: CGFloat,
+        centerY: CGFloat,
+        font: NSFont,
+        color: NSColor
+    ) {
+        let text = s as NSString
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: color,
+        ]
+        let size = text.size(withAttributes: attrs)
+        let origin = NSPoint(x: right - size.width, y: centerY - size.height * 0.5)
         text.draw(at: origin, withAttributes: attrs)
     }
 }
@@ -301,7 +320,7 @@ enum TaskSounds {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
 
-    // Grok menu
+    // Grok
     private var gHeader: NSMenuItem!
     private var gRemaining: NSMenuItem!
     private var gReset: NSMenuItem!
@@ -311,7 +330,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var gActivity: NSMenuItem!
     private var gDetail: NSMenuItem!
 
-    // Codex menu
+    // Hermes
+    private var hHeader: NSMenuItem!
+    private var hBalance: NSMenuItem!
+    private var hModel: NSMenuItem!
+    private var hToday: NSMenuItem!
+    private var hMonth: NSMenuItem!
+    private var hActivity: NSMenuItem!
+    private var hDetail: NSMenuItem!
+
+    // Codex
     private var cHeader: NSMenuItem!
     private var cRemaining: NSMenuItem!
     private var cReset: NSMenuItem!
@@ -336,6 +364,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         subscriptionAutoRenew: nil, tokensToday: nil, tokensMonth: nil,
         email: nil, fromCache: false, error: nil
     )
+    private var hermesInfo = HermesInfo(
+        balance: nil, currency: "CNY", grantedBalance: nil, toppedUpBalance: nil,
+        tokensToday: nil, tokensMonth: nil, model: nil, busy: false,
+        fromCache: false, error: nil
+    )
     private var codexInfo = CodexInfo(
         remainingPercent: nil, usedPercent: nil, resetsAt: nil,
         windowLabel: nil, secondaryRemaining: nil, secondaryResetsAt: nil,
@@ -346,6 +379,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     )
 
     private var grokBusy = false
+    private var hermesBusy = false
     private var codexBusy = false
     private var blinkLit = true
     private var stickyCodexUntil: Date = .distantPast
@@ -375,17 +409,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.isVisible = true
         if let button = statusItem.button {
-            button.image = MenuBarChip.image(grokText: "…", codexText: "…")
+            button.image = MenuBarChip.image(grokText: "…", hermesText: "…", codexText: "…")
             button.imagePosition = .imageOnly
             button.imageHugsTitle = true
             button.title = ""
-            button.toolTip = "Grok · Codex 用量"
+            button.toolTip = "Grok · Hermes · Codex"
         }
 
         let menu = NSMenu()
         menu.autoenablesItems = false
 
-        // Section tints match menubar chip brand colors
         gHeader = section("Grok", tint: NSColor(calibratedWhite: 0.55, alpha: 1))
         menu.addItem(gHeader)
         gRemaining = disabled("余量: …"); menu.addItem(gRemaining)
@@ -395,6 +428,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         gMonth = disabled("本月 Token: —"); menu.addItem(gMonth)
         gActivity = disabled("任务: 空闲"); menu.addItem(gActivity)
         gDetail = disabled("更新: …"); menu.addItem(gDetail)
+
+        menu.addItem(.separator())
+
+        hHeader = section("Hermes", tint: NSColor(srgbRed: 0.35, green: 0.40, blue: 0.78, alpha: 1))
+        menu.addItem(hHeader)
+        hBalance = disabled("余额: …"); menu.addItem(hBalance)
+        hModel = disabled("模型: …"); menu.addItem(hModel)
+        hToday = disabled("今日 Token: —"); menu.addItem(hToday)
+        hMonth = disabled("本月 Token: —"); menu.addItem(hMonth)
+        hActivity = disabled("任务: 空闲"); menu.addItem(hActivity)
+        hDetail = disabled("更新: …"); menu.addItem(hDetail)
 
         menu.addItem(.separator())
 
@@ -432,6 +476,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let openG = NSMenuItem(title: "打开 Grok 用量页", action: #selector(openGrok), keyEquivalent: "")
         openG.target = self
         menu.addItem(openG)
+        let openH = NSMenuItem(title: "打开 DeepSeek 余额页", action: #selector(openHermes), keyEquivalent: "")
+        openH.target = self
+        menu.addItem(openH)
         let openC = NSMenuItem(title: "打开 Codex 用量页", action: #selector(openCodex), keyEquivalent: "")
         openC.target = self
         menu.addItem(openC)
@@ -444,7 +491,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ))
 
         statusItem.menu = menu
-
         refreshAll(forceLive: true)
         pollActivity()
 
@@ -487,7 +533,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         TaskSounds.isEnabled.toggle()
         soundItem.title = TaskSounds.isEnabled ? "关闭音效" : "开启音效"
         if TaskSounds.isEnabled {
-            if grokBusy || codexBusy { TaskSounds.startRunning() }
+            if grokBusy || hermesBusy || codexBusy { TaskSounds.startRunning() }
             log("sound enabled")
         } else {
             TaskSounds.stopRunning()
@@ -498,7 +544,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func openGrok() {
         if let u = URL(string: "https://grok.com/?_s=usage") { NSWorkspace.shared.open(u) }
     }
-
+    @objc private func openHermes() {
+        if let u = URL(string: "https://platform.deepseek.com/usage") { NSWorkspace.shared.open(u) }
+    }
     @objc private func openCodex() {
         if let u = URL(string: "https://chatgpt.com/codex/usage") { NSWorkspace.shared.open(u) }
     }
@@ -506,9 +554,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func refreshAll(forceLive: Bool) {
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let g = GrokFetcher.fetch(forceLive: forceLive)
+            let h = HermesFetcher.fetch(forceLive: forceLive)
             let c = CodexFetcher.fetch(forceLive: forceLive)
             DispatchQueue.main.async {
                 self?.applyGrok(g)
+                self?.applyHermes(h)
                 self?.applyCodex(c)
             }
         }
@@ -517,36 +567,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func pollActivity() {
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let gBusy = !GrokActivity.busySessionIds().isEmpty
+            let hBusy = HermesFetcher.isBusy()
             let cRaw = CodexActivity.isTaskRunning()
             DispatchQueue.main.async {
-                self?.applyActivity(grok: gBusy, codexRaw: cRaw)
+                self?.applyActivity(grok: gBusy, hermes: hBusy, codexRaw: cRaw)
             }
         }
     }
 
-    private func applyActivity(grok: Bool, codexRaw: Bool) {
+    private func applyActivity(grok: Bool, hermes: Bool, codexRaw: Bool) {
         let now = Date()
         if codexRaw { stickyCodexUntil = now.addingTimeInterval(5) }
         let cBusy = codexRaw || now < stickyCodexUntil
 
         let gChanged = grok != grokBusy
+        let hChanged = hermes != hermesBusy
         let cChanged = cBusy != codexBusy
         grokBusy = grok
+        hermesBusy = hermes
         codexBusy = cBusy
 
         gActivity.title = grokBusy ? "任务: 运行中 ●" : "任务: 空闲"
+        hActivity.title = hermesBusy ? "任务: 运行中 ●" : "任务: 空闲"
         cActivity.title = codexBusy ? "任务: 运行中 ●" : "任务: 空闲"
 
         if gChanged { log(grokBusy ? "grok task started" : "grok task ended") }
+        if hChanged { log(hermesBusy ? "hermes task started" : "hermes task ended") }
         if cChanged { log(codexBusy ? "codex task started" : "codex task ended") }
 
-        TaskSounds.sync(withAnyTaskRunning: grokBusy || codexBusy)
-        if !grokBusy && !codexBusy { blinkLit = true }
+        TaskSounds.sync(withAnyTaskRunning: grokBusy || hermesBusy || codexBusy)
+        if !grokBusy && !hermesBusy && !codexBusy { blinkLit = true }
         updateStatusAppearance()
     }
 
     private func tickBlink() {
-        guard grokBusy || codexBusy else { return }
+        guard grokBusy || hermesBusy || codexBusy else { return }
         blinkLit.toggle()
         updateStatusAppearance()
     }
@@ -583,6 +638,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let warn = merged.error != nil ? " · 警告" : ""
             gDetail.title = "更新: \(f.string(from: Date())) (\(cache))\(warn)"
             log("grok remaining=\(merged.remainingText)")
+        }
+        updateStatusAppearance()
+    }
+
+    private func applyHermes(_ info: HermesInfo) {
+        var merged = info
+        if merged.balance == nil, let prev = hermesInfo.balance {
+            merged.balance = prev
+            merged.currency = merged.currency ?? hermesInfo.currency
+            merged.fromCache = true
+        }
+        merged.tokensToday = info.tokensToday ?? hermesInfo.tokensToday
+        merged.tokensMonth = info.tokensMonth ?? hermesInfo.tokensMonth
+        merged.model = info.model ?? hermesInfo.model
+        hermesInfo = merged
+
+        hToday.title = "今日 Token: \(merged.tokensTodayText)"
+        hMonth.title = "本月 Token: \(merged.tokensMonthText)"
+        hModel.title = "模型: \(merged.model ?? "—")"
+
+        if let err = merged.error, merged.balance == nil {
+            hBalance.title = "余额: 获取失败"
+            hDetail.title = "错误: \(String(err.prefix(36)))"
+            log("hermes error: \(err)")
+        } else {
+            hBalance.title = "余额: \(merged.balanceText) (DeepSeek)"
+            let f = DateFormatter(); f.dateFormat = "HH:mm:ss"
+            let cache = merged.fromCache ? "缓存" : "实时"
+            let warn = merged.error != nil ? " · 警告" : ""
+            hDetail.title = "更新: \(f.string(from: Date())) (\(cache))\(warn)"
+            log("hermes balance=\(merged.balanceText)")
         }
         updateStatusAppearance()
     }
@@ -644,7 +730,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updateStatusAppearance()
     }
 
-    /// Compact integer percent for the stacked chip (no % sign — cleaner).
     private func compactPercent(_ p: Double?) -> String {
         guard let p else { return "—" }
         return "\(Int(p.rounded()))"
@@ -653,34 +738,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func updateStatusAppearance() {
         guard let button = statusItem.button else { return }
         let gLow = (grokInfo.remainingPercent ?? 100) <= 10 && grokInfo.remainingPercent != nil
+        // Hermes "low" when balance under 10 CNY
+        let hLow = (hermesInfo.balance ?? 100) < 10 && hermesInfo.balance != nil
         let cLow = (codexInfo.remainingPercent ?? 100) <= 10 && codexInfo.remainingPercent != nil
         let showG = !grokBusy || blinkLit
+        let showH = !hermesBusy || blinkLit
         let showC = !codexBusy || blinkLit
 
-        let gText = compactPercent(grokInfo.remainingPercent)
-        let cText = compactPercent(codexInfo.remainingPercent)
-
-        // Entire chip is one image: stacked rings + vertically stacked digits
         button.imagePosition = .imageOnly
         button.title = ""
         button.image = MenuBarChip.image(
-            grokText: gText,
-            codexText: cText,
+            grokText: compactPercent(grokInfo.remainingPercent),
+            hermesText: hermesInfo.compactText,
+            codexText: compactPercent(codexInfo.remainingPercent),
             grokLow: gLow,
+            hermesLow: hLow,
             codexLow: cLow,
             showG: showG,
+            showH: showH,
             showC: showC
         )
 
         var tip = """
-        Grok  \(grokInfo.remainingText)  ·  重置 \(grokInfo.resetText)
-        Codex \(codexInfo.remainingText)  ·  重置 \(codexInfo.resetText)
+        Grok   \(grokInfo.remainingText)
+        Hermes \(hermesInfo.balanceText)
+        Codex  \(codexInfo.remainingText)
         """
-        if grokBusy || codexBusy {
+        if grokBusy || hermesBusy || codexBusy {
             var parts: [String] = []
-            if grokBusy { parts.append("Grok 运行中") }
-            if codexBusy { parts.append("Codex 运行中") }
-            tip = "● " + parts.joined(separator: " · ") + "\n" + tip
+            if grokBusy { parts.append("Grok") }
+            if hermesBusy { parts.append("Hermes") }
+            if codexBusy { parts.append("Codex") }
+            tip = "● 运行中: " + parts.joined(separator: " · ") + "\n" + tip
         }
         button.toolTip = tip
     }

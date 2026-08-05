@@ -5,8 +5,9 @@ import Foundation
 // Combined AI Credits menubar — Grok + Codex stacked in one status item.
 
 enum MenuBarPercentFont {
+    /// Times New Roman for menubar letters and numbers.
     static func font(size: CGFloat = 11) -> NSFont {
-        for name in ["Times New Roman", "TimesNewRomanPSMT", "TimesNewRomanPS-BoldMT", "Times"] {
+        for name in ["Times New Roman", "TimesNewRomanPSMT", "Times"] {
             if let f = NSFont(name: name, size: size) { return f }
         }
         return NSFont.systemFont(ofSize: size)
@@ -1252,3 +1253,169 @@ enum CodexActivity {
 
 // MARK: - App
 
+
+
+// MARK: - Hermes (DeepSeek API balance)
+
+struct HermesInfo {
+    var balance: Double?
+    var currency: String?
+    var grantedBalance: Double?
+    var toppedUpBalance: Double?
+    var tokensToday: Int?
+    var tokensMonth: Int?
+    var model: String?
+    var busy: Bool
+    var fromCache: Bool
+    var error: String?
+
+    var balanceText: String {
+        guard let b = balance else { return "—" }
+        let cur = currency ?? "CNY"
+        if cur == "CNY" {
+            if b >= 100 {
+                return String(format: "¥%.0f", b)
+            }
+            return String(format: "¥%.2f", b).replacingOccurrences(of: ".00", with: "")
+        }
+        return String(format: "%.2f %@", b, cur)
+    }
+
+    /// Compact menubar number (integer only, no currency symbol).
+    var compactText: String {
+        guard let b = balance else { return "—" }
+        return String(Int(b.rounded()))
+    }
+
+    var tokensTodayText: String { GrokInfo.formatTokens(tokensToday) }
+    var tokensMonthText: String { GrokInfo.formatTokens(tokensMonth) }
+}
+
+enum HermesFetcher {
+    private static var cache: (date: Date, info: HermesInfo)?
+    private static let cacheTTL: TimeInterval = 100
+
+    private static var helperPath: String? {
+        if let env = ProcessInfo.processInfo.environment["HERMES_BALANCE_BIN"], !env.isEmpty {
+            let p = (env as NSString).expandingTildeInPath
+            if FileManager.default.isReadableFile(atPath: p) { return p }
+        }
+        let home = NSHomeDirectory() as NSString
+        let paths = [
+            Bundle.main.bundlePath + "/Contents/Resources/hermes-balance",
+            home.appendingPathComponent(".local/bin/hermes-balance"),
+            home.appendingPathComponent("Documents/Ai-credits-menubar/hermes/scripts/hermes-balance"),
+            (FileManager.default.currentDirectoryPath as NSString)
+                .appendingPathComponent("hermes/scripts/hermes-balance"),
+        ]
+        for p in paths where FileManager.default.isReadableFile(atPath: p) {
+            return p
+        }
+        return nil
+    }
+
+    static func fetch(forceLive: Bool) -> HermesInfo {
+        if !forceLive, let cached = cache, Date().timeIntervalSince(cached.date) < cacheTTL {
+            var info = cached.info
+            info.fromCache = true
+            return info
+        }
+        guard let script = helperPath else {
+            return HermesInfo(
+                balance: nil, currency: "CNY", grantedBalance: nil, toppedUpBalance: nil,
+                tokensToday: nil, tokensMonth: nil, model: nil, busy: false,
+                fromCache: false, error: "未找到 hermes-balance"
+            )
+        }
+        let proc = Process()
+        if FileManager.default.isExecutableFile(atPath: script) {
+            proc.executableURL = URL(fileURLWithPath: script)
+            proc.arguments = []
+        } else {
+            proc.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+            proc.arguments = [script]
+        }
+        proc.environment = ProcessInfo.processInfo.environment.merging([
+            "HOME": NSHomeDirectory(),
+            "HERMES_HOME": (NSHomeDirectory() as NSString).appendingPathComponent(".hermes"),
+            "PATH": "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin",
+        ]) { _, new in new }
+        let out = Pipe()
+        proc.standardOutput = out
+        proc.standardError = Pipe()
+        do {
+            try proc.run()
+        } catch {
+            return HermesInfo(
+                balance: nil, currency: "CNY", grantedBalance: nil, toppedUpBalance: nil,
+                tokensToday: nil, tokensMonth: nil, model: nil, busy: false,
+                fromCache: false, error: error.localizedDescription
+            )
+        }
+        let deadline = Date().addingTimeInterval(15)
+        while proc.isRunning, Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        if proc.isRunning {
+            proc.terminate()
+            return HermesInfo(
+                balance: nil, currency: "CNY", grantedBalance: nil, toppedUpBalance: nil,
+                tokensToday: nil, tokensMonth: nil, model: nil, busy: false,
+                fromCache: false, error: "timeout"
+            )
+        }
+        proc.waitUntilExit()
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return HermesInfo(
+                balance: nil, currency: "CNY", grantedBalance: nil, toppedUpBalance: nil,
+                tokensToday: nil, tokensMonth: nil, model: nil, busy: false,
+                fromCache: false, error: "JSON 解析失败"
+            )
+        }
+        let balance: Double? = {
+            if let d = json["balance"] as? Double { return d }
+            if let n = json["balance"] as? NSNumber { return n.doubleValue }
+            if let s = json["balance"] as? String { return Double(s) }
+            return nil
+        }()
+        let info = HermesInfo(
+            balance: balance,
+            currency: json["currency"] as? String ?? "CNY",
+            grantedBalance: (json["granted_balance"] as? NSNumber)?.doubleValue,
+            toppedUpBalance: (json["topped_up_balance"] as? NSNumber)?.doubleValue,
+            tokensToday: (json["tokens_today"] as? NSNumber)?.intValue,
+            tokensMonth: (json["tokens_month"] as? NSNumber)?.intValue,
+            model: json["model"] as? String,
+            busy: (json["busy"] as? Bool) ?? false,
+            fromCache: false,
+            error: json["error"] as? String
+        )
+        cache = (Date(), info)
+        return info
+    }
+
+    /// Lightweight busy poll (no network) via state.db last activity.
+    static func isBusy() -> Bool {
+        let db = (NSHomeDirectory() as NSString).appendingPathComponent(".hermes/state.db")
+        guard FileManager.default.fileExists(atPath: db) else { return false }
+        let now = Date().timeIntervalSince1970
+        let sql = """
+        SELECT last_activity_at FROM sessions
+        WHERE ended_at IS NULL
+        ORDER BY last_activity_at DESC LIMIT 1;
+        """
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
+        proc.arguments = [db, sql]
+        let out = Pipe()
+        proc.standardOutput = out
+        proc.standardError = Pipe()
+        do { try proc.run(); proc.waitUntilExit() } catch { return false }
+        guard proc.terminationStatus == 0 else { return false }
+        let text = String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard let ts = Double(text), ts > 0 else { return false }
+        return (now - ts) < 90
+    }
+}

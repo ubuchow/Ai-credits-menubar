@@ -25,6 +25,19 @@ if [[ -f "$REPO/grok/scripts/grok-credits" ]]; then
   cp -f "$REPO/grok/scripts/grok-credits" "$RES/grok-credits"
   chmod +x "$RES/grok-credits"
 fi
+# Hermes (DeepSeek) balance helper
+if [[ -f "$REPO/hermes/scripts/hermes-balance" ]]; then
+  cp -f "$REPO/hermes/scripts/hermes-balance" "$RES/hermes-balance"
+  chmod +x "$RES/hermes-balance"
+fi
+# App icon (G/H/C triangle)
+ICON_SRC="$REPO/assets/AppIcon.icns"
+if [[ ! -f "$ICON_SRC" && -f "$ROOT/scripts/generate-app-icon.py" ]]; then
+  python3 "$ROOT/scripts/generate-app-icon.py" || true
+fi
+if [[ -f "$ICON_SRC" ]]; then
+  cp -f "$ICON_SRC" "$RES/AppIcon.icns"
+fi
 
 swiftc -O -whole-module-optimization \
   -o "$BIN" \
@@ -41,10 +54,11 @@ cat > "$APP_DIR/Contents/Info.plist" <<'EOF'
   <key>CFBundleName</key><string>AI Credits</string>
   <key>CFBundleDisplayName</key><string>AI Credits</string>
   <key>CFBundleIdentifier</key><string>com.github.ai-credits-menubar.combined</string>
-  <key>CFBundleVersion</key><string>2.0.0</string>
-  <key>CFBundleShortVersionString</key><string>2.0.0</string>
+  <key>CFBundleVersion</key><string>2.1.0</string>
+  <key>CFBundleShortVersionString</key><string>2.1.0</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleExecutable</key><string>AICredits</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>LSUIElement</key><true/>
   <key>NSHighResolutionCapable</key><true/>
@@ -53,4 +67,6 @@ cat > "$APP_DIR/Contents/Info.plist" <<'EOF'
 </plist>
 EOF
 codesign --force --deep --sign - "$APP_DIR" 2>/dev/null || true
+# Refresh Finder / Dock icon cache for this app
+touch "$APP_DIR"
 echo "✓ $APP_DIR"

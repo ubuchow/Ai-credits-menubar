@@ -36,6 +36,7 @@ rm -rf "$HOME/Applications/Grok Credits.app" "$HOME/Applications/Codex Credits.a
 install -m 0755 "$REPO/grok/scripts/grok-credits" "$HELPER_DIR/grok-credits"
 install -m 0755 "$REPO/grok/scripts/grok-credits" "$HOME/.grok/bin/grok-credits" 2>/dev/null || true
 install -m 0755 "$REPO/codex/scripts/codex-usage-stats" "$HELPER_DIR/codex-usage-stats" 2>/dev/null || true
+install -m 0755 "$REPO/hermes/scripts/hermes-balance" "$HELPER_DIR/hermes-balance" 2>/dev/null || true
 
 "$ROOT/build.sh"
 
@@ -75,7 +76,7 @@ sleep 1
 launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null || launchctl load "$PLIST" 2>/dev/null || true
 open -a "$APP" 2>/dev/null || true
 
-echo "✓ AI Credits installed (Grok + Codex stacked in one menu bar slot)"
+echo "✓ AI Credits installed (Grok + Hermes + Codex triangle chip)"
 echo "  App: $APP"
-echo "  Menubar: stacked G/C mark + stacked dual % chip (G top · C bottom)"
+echo "  Menubar: triangle  G top · H left · C right  (numbers beside each circle)"
 echo "  Legacy Grok Credits / Codex Credits apps were removed to free the second slot."

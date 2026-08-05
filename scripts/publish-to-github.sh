@@ -8,7 +8,7 @@ cd "$ROOT"
 
 REPO_NAME="Ai-credits-menubar"
 VISIBILITY="public"   # public | private
-DESCRIPTION="Ai工具余额展示 — macOS 菜单栏显示 Grok Build / OpenAI Codex 用量余量与重置时间"
+DESCRIPTION="Ai工具余额展示 — macOS 菜单栏显示 Grok / Hermes(DeepSeek) / Codex 余量与任务状态"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
